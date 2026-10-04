@@ -7,6 +7,10 @@ Fast Gibbs samplers for the Bayesian $L_{1/2}$ regression of
 showing that the $L_{1/2}$ prior is exactly the Dirichlet–Laplace prior
 of Bhattacharya et al. (2015) at concentration $a = 3/2$.
 
+A walkthrough with executed examples (simulation, posterior summaries,
+both algorithm pairings, standardization, warm restarts, JAX) is in
+[`demo.ipynb`](demo.ipynb).
+
 ## Model
 
 $$Y = X\beta + \varepsilon, \qquad \varepsilon \sim \mathcal N_n(0, \sigma^2 I_n),$$
