@@ -190,41 +190,66 @@ fairly informative $\sigma^2$ prior or external knowledge of $\sigma^2$.
 
 ## Performance
 
-End-to-end throughput (iterations/sec; CPU, float32, 16-core machine,
-torch MKL 8 threads, JAX CPU-only; benchmark script:
-`test_JAX/_bench_cpu_vs_torch.py`):
+All numbers are **end-to-end driver throughput** (kept Gibbs iterations
+per second) at **single precision (float32)**: same simulated data,
+regimes and iteration counts in every column, warm-up excluded on both
+sides (PyTorch: 30-iteration warm-up run; JAX: AOT compilation not
+counted in `runtime_sec`). Machine: 16-core CPU (torch MKL 8 threads),
+RTX 3060 Ti 8 GB. The GPU columns are cross-environment on the same
+physical card — PyTorch on native Windows CUDA, JAX on WSL2 with
+`jax[cuda12]` (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) — so the WSL2
+layer only adds overhead to the JAX side. Benchmark scripts:
+`test_JAX/_bench_cpu_vs_torch.py` (CPU), `test/_bench_gpu_driver.py`
+(PyTorch GPU), `test_JAX/_bench_gpu_driver.py` (JAX GPU).
 
-| regime | method | PyTorch | JAX (`lax.scan`) | JAX / torch |
+### 1. CPU (float32)
+
+| regime | method | PyTorch | JAX | JAX / PyTorch |
 | --- | --- | --- | --- | --- |
-| $n{=}100,\ p{=}500$ | fast | 1163 | 3704 | **3.2×** |
-| $n{=}100,\ p{=}4000$ | fast | 793 | 1008 | **1.3×** |
-| $n{=}800,\ p{=}800$ | fast | 229 | 332 | **1.4×** |
-| $n{=}2000,\ p{=}500$ | direct | 742 | 374 | 0.5× |
+| $n{=}100,\ p{=}500$ | fast | 1116 | 3596 | **3.2×** |
+| $n{=}100,\ p{=}4000$ | fast | 755 | 987 | **1.3×** |
+| $n{=}800,\ p{=}800$ | fast | 231 | 331 | **1.4×** |
+| $n{=}2000,\ p{=}500$ | direct | 697 | 344 | 0.49× |
+| $n{=}8000,\ p{=}500$ | direct | 521 | 296 | 0.57× |
 
-JAX wins where per-iteration work is small/medium (jit fusion of the
-S3–S5 elementwise chain); PyTorch's multithreaded MKL keeps the edge in
-the large-`direct` regime dominated by big Cholesky factorizations. The
-PyTorch version additionally offers a CUDA path for large problems.
+### 2. GPU (float32, RTX 3060 Ti)
 
-### JAX on GPU (CUDA)
+All `test_JAX/` suites pass unchanged on the GPU backend; posterior
+means agree with the CPU/float64 reference chains.
 
-All `test_JAX/` suites pass unchanged on GPU (WSL2 Ubuntu,
-`pip install "jax[cuda12]"`, jax 0.11.2, RTX 3060 Ti 8 GB; posterior
-means agree with the CPU/float64 reference chains). Driver-level
-throughput on the same 16-core machine:
-
-| workload | method | JAX CPU (Windows) | JAX GPU (WSL2) | speedup |
+| regime | method | PyTorch (CUDA) | JAX (CUDA) | JAX / PyTorch |
 | --- | --- | --- | --- | --- |
-| $n{=}100,\ p{=}4000$ | fast | 962 | 650–950 | $\approx$1× — no benefit |
-| $n{=}8000,\ p{=}500$ | direct | 248 | 795 | **3.2×** |
+| $n{=}100,\ p{=}500$ | fast | 328 | ~1500 | **4.6×** |
+| $n{=}100,\ p{=}4000$ | fast | 327 | ~1270 | **3.9×** |
+| $n{=}800,\ p{=}800$ | fast | 291 | ~600 | **2.1×** |
+| $n{=}2000,\ p{=}500$ | direct | 326 | ~740 | **2.3×** |
+| $n{=}8000,\ p{=}500$ | direct | 320 | ~510 | **1.6×** |
 
-At the latter size the per-iteration $p \times p$ Cholesky alone is
-$\sim$29× faster on GPU (48.7 ms $\to$ 1.7 ms). GPU pays off once the
-Cholesky factorization dominates the iteration; small chains are
-kernel-launch-latency bound and stay as fast (or faster) on CPU. On a
-partly occupied 8 GB card, export `XLA_PYTHON_CLIENT_PREALLOCATE=false`
-to skip XLA's default 75 %-of-memory preallocation (the allocator's
-startup retries are noisy but harmless).
+### Reading the tables
+
+- **CPU, framework vs framework:** JAX leads at small/medium
+  per-iteration work — XLA fuses the S3–S5 elementwise chain inside
+  `lax.scan` (the standalone shrinkage step alone is ~7× faster than
+  eager PyTorch). PyTorch's multithreaded MKL keeps the edge in the
+  large-`direct` regime, which is dominated by one big Cholesky
+  factorization per iteration.
+- **GPU, framework vs framework:** JAX is 1.6–4.6× faster than PyTorch
+  on the same card at every regime tested. Its chunked `lax.scan` runs
+  the whole chain as one compiled XLA While loop and touches the host
+  only once per 500 draws, keeping the GPU busy; the eager PyTorch
+  driver launches ~a dozen kernels plus a host copy of the draws every
+  iteration and is launch-latency bound — a flat ~300 it/s at every
+  regime, i.e. on these sizes even slower than PyTorch on CPU.
+- **GPU vs CPU:** JAX-GPU overtakes JAX-CPU from $n{=}100,\ p{=}4000$
+  upward (1.3–2.2×); at the smallest regime ($n{=}100,\ p{=}500$) JAX
+  on CPU is the fastest option of all (3596 it/s). Pick the GPU once
+  the per-iteration flops ($O(n^2 p)$ or $O(p^3)$) outweigh the launch
+  overhead.
+- GPU throughputs vary ±10–15% between runs (clock/thermal state);
+  "~" marks the mean of repeated runs. On a partly occupied 8 GB card,
+  export `XLA_PYTHON_CLIENT_PREALLOCATE=false` to skip XLA's default
+  75 %-of-memory preallocation (the allocator's startup retries are
+  noisy but harmless).
 
 ## Repository layout
 
@@ -247,7 +272,9 @@ python test_JAX/_test_GS_LH.py      # JAX end-to-end
 python test_JAX/_test_beta.py       # 200k-draw moment checks of the beta sampler
 python test_JAX/_test_sigma2.py     # 200k-draw InvGamma moment checks
 python test_JAX/_test_vs_torch.py   # JAX (float32) vs PyTorch (float64) cross-validation
-python test_JAX/_bench_cpu_vs_torch.py   # CPU float32 benchmark
+python test_JAX/_bench_cpu_vs_torch.py   # CPU float32 benchmark (torch vs JAX)
+python test/_bench_gpu_driver.py         # PyTorch-GPU float32 benchmark (CUDA)
+python test_JAX/_bench_gpu_driver.py     # JAX-GPU float32 benchmark (jax[cuda12], e.g. WSL2)
 ```
 
 ## References

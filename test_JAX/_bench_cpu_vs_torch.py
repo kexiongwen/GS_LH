@@ -106,7 +106,8 @@ if __name__ == "__main__":
             (100, 500, "fast", 4000),
             (100, 4000, "fast", 2000),
             (800, 800, "fast", 400),
-            (2000, 500, "direct", 800)]:
+            (2000, 500, "direct", 800),
+            (8000, 500, "direct", 300)]:
         rate_t, rate_j = bench_driver(n, p, method, total)
         print(f"n={n:5d}, p={p:5d}     | {method:6s} | {total:5d} | "
               f"{rate_t:10.0f} | {rate_j:9.0f} | {rate_j / rate_t:8.2f}x")
