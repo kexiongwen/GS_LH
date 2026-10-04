@@ -100,13 +100,14 @@ def test_standardize():
 
 def test_speed():
     print("=== Test 4: backend + throughput ===")
+    dev = jax.devices()[0]
     print(f"  JAX devices: {jax.devices()}")
     n, p = 100, 4000
     X, Y, _ = simulate(n, p, {0: 1.5, 1: -1.0, 2: 0.8}, sigma=1.0, seed=6)
     out = GS_LH(X, Y, n_iter=500, burnin=100, method="fast",
                 standardize=False, seed=11)
     rate = 600 / out["runtime_sec"]
-    print(f"  CPU (n=100, p=4000): {rate:.0f} it/s "
+    print(f"  {dev.platform.upper()} (n=100, p=4000): {rate:.0f} it/s "
           f"-> 10k iterations ~ {10000 / rate:.0f}s")
 
 

@@ -106,7 +106,8 @@ def bench(fn, args, reps):
 
 def benchmark():
     a1, b1 = 3.0, 2.0
-    print("\nS1 timing per draw (sparse w, s=20); * = fastest in row:")
+    dev = jax.devices()[0].platform.upper()   # CPU or GPU
+    print(f"\nS1 timing per draw (sparse w, s=20); * = fastest in row:")
     for n, p, reps in [(100, 4000, 50), (8000, 500, 20)]:
         g = np.random.default_rng(3)
         X = jnp.asarray(g.standard_normal((n, p)), jnp.float32)
@@ -116,7 +117,7 @@ def benchmark():
         t1 = bench(sigma2_sample, args, reps)
         t2 = bench(sigma2_sample_direct, args, reps)
         best = min(t1, t2)
-        print(f"  CPU float32 n={n:5d}, p={p:5d}: "
+        print(f"  {dev} float32 n={n:5d}, p={p:5d}: "
               f"n-chol {t1 * 1e3:8.2f}{'*' if t1 == best else ' '} "
               f"p-chol {t2 * 1e3:8.2f}{'*' if t2 == best else ' '} ms")
 
