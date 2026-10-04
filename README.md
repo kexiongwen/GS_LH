@@ -74,9 +74,11 @@ pip install numpy torch        # for GS_LH (PyTorch version)
 pip install numpy jax          # for GS_LH_JAX (JAX version)
 ```
 
-Developed and tested with Python 3 (conda), `torch 2.14`, `jax 0.11`.
-The JAX version needs no GPU (tested CPU-only); the PyTorch version runs
-on CPU or CUDA.
+Developed and tested with Python 3 (conda), `torch 2.14`, `jax 0.11.2`
+(identical JAX version on Windows/CPU and WSL2/CUDA). The JAX version
+runs CPU-only on native Windows; for GPU use `pip install "jax[cuda12]"`
+under WSL2/Linux (verified on an RTX 3060 Ti — see Performance). The
+PyTorch version runs on CPU or CUDA.
 
 ## Quick start
 
@@ -138,7 +140,7 @@ Both drivers share the same interface and return a dict:
 | | `GS_LH` (PyTorch) | `GS_LH_JAX` (JAX) |
 | --- | --- | --- |
 | precision | follows input dtype (float64 recommended/tested) | fixed float32 |
-| device | CPU, CUDA | CPU (Windows), GPU where JAX supports it |
+| device | CPU, CUDA | CPU (native Windows); GPU via CUDA — e.g. WSL2 `jax[cuda12]` (tested: RTX 3060 Ti) |
 | sampling loop | eager Python loop | chunked `jax.lax.scan`, whole chain XLA-compiled |
 | RNG | `torch.manual_seed` | explicit `jax.random.PRNGKey` |
 | draws returned as | CPU `torch.Tensor` | `numpy.ndarray` |
@@ -203,6 +205,26 @@ JAX wins where per-iteration work is small/medium (jit fusion of the
 S3–S5 elementwise chain); PyTorch's multithreaded MKL keeps the edge in
 the large-`direct` regime dominated by big Cholesky factorizations. The
 PyTorch version additionally offers a CUDA path for large problems.
+
+### JAX on GPU (CUDA)
+
+All `test_JAX/` suites pass unchanged on GPU (WSL2 Ubuntu,
+`pip install "jax[cuda12]"`, jax 0.11.2, RTX 3060 Ti 8 GB; posterior
+means agree with the CPU/float64 reference chains). Driver-level
+throughput on the same 16-core machine:
+
+| workload | method | JAX CPU (Windows) | JAX GPU (WSL2) | speedup |
+| --- | --- | --- | --- | --- |
+| $n{=}100,\ p{=}4000$ | fast | 962 | 650–950 | $\approx$1× — no benefit |
+| $n{=}8000,\ p{=}500$ | direct | 248 | 795 | **3.2×** |
+
+At the latter size the per-iteration $p \times p$ Cholesky alone is
+$\sim$29× faster on GPU (48.7 ms $\to$ 1.7 ms). GPU pays off once the
+Cholesky factorization dominates the iteration; small chains are
+kernel-launch-latency bound and stay as fast (or faster) on CPU. On a
+partly occupied 8 GB card, export `XLA_PYTHON_CLIENT_PREALLOCATE=false`
+to skip XLA's default 75 %-of-memory preallocation (the allocator's
+startup retries are noisy but harmless).
 
 ## Repository layout
 
