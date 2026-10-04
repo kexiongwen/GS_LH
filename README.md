@@ -239,3 +239,7 @@ python test_JAX/_bench_cpu_vs_torch.py   # CPU float32 benchmark
 - Nishimura, A., & Suchard, M. A. (2022). Prior-preconditioned conjugate
   gradient method for accelerated Gibbs sampling in "large n, large p"
   Bayesian sparse regression. *JASA*, 118(544), 2468–2481.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
