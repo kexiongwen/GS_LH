@@ -89,8 +89,8 @@ import torch
 from GS_LH import GS_LH
 
 n, p = 100, 500
-X = torch.randn(n, p)
-y = torch.randn(n)
+X = torch.randn(n, p, dtype=torch.float64)   # float64 recommended
+y = torch.randn(n, dtype=torch.float64)
 
 out = GS_LH(X, y, n_iter=4000, burnin=1000, seed=42)
 beta_mean  = out["beta"].mean(0)     # posterior mean of beta
@@ -191,8 +191,10 @@ fairly informative $\sigma^2$ prior or external knowledge of $\sigma^2$.
 ## Performance
 
 All numbers are **end-to-end driver throughput** (kept Gibbs iterations
-per second) at **single precision (float32)**: same simulated data,
-regimes and iteration counts in every column, warm-up excluded on both
+per second) at **single precision (float32)**: identical regimes and
+iteration counts in every column — on CPU both frameworks also run the
+same simulated data in one process; throughput does not depend on the
+data values — warm-up excluded on both
 sides (PyTorch: 30-iteration warm-up run; JAX: AOT compilation not
 counted in `runtime_sec`). Machine: 16-core CPU (torch MKL 8 threads),
 RTX 3060 Ti 8 GB. The GPU columns are cross-environment on the same
@@ -239,7 +241,8 @@ means agree with the CPU/float64 reference chains.
   only once per 500 draws, keeping the GPU busy; the eager PyTorch
   driver launches ~a dozen kernels plus a host copy of the draws every
   iteration and is launch-latency bound — a flat ~300 it/s at every
-  regime, i.e. on these sizes even slower than PyTorch on CPU.
+  regime, below PyTorch's own CPU throughput at every size except
+  $n{=}800,\ p{=}800$.
 - **GPU vs CPU:** JAX-GPU overtakes JAX-CPU from $n{=}100,\ p{=}4000$
   upward (1.3–2.2×); at the smallest regime ($n{=}100,\ p{=}500$) JAX
   on CPU is the fastest option of all (3596 it/s). Pick the GPU once
@@ -257,9 +260,11 @@ means agree with the CPU/float64 reference chains.
 GS_LH/          PyTorch package (driver + S1/S2/S3-S5 step modules)
 GS_LH_JAX/      JAX package (float32, chunked lax.scan driver)
 test/           PyTorch test suite & benchmarks
-test_JAX/       JAX test suite, JAX-vs-PyTorch cross-check & CPU benchmark
+test_JAX/       JAX test suite, JAX-vs-PyTorch cross-check & benchmarks
+demo.ipynb      executed walkthrough (simulation, summaries, both methods, JAX)
 On the Connection between Dirichlet–Laplace Prior and L1_2 Prior.md
                 the mathematical note (DL at a = 3/2  <=>  L1/2)
+LICENSE         MIT
 ```
 
 ## Running the tests
@@ -268,6 +273,9 @@ Plain scripts (no pytest needed), run from the repo root:
 
 ```bash
 python test/_test_GS_LH.py          # PyTorch end-to-end (recovery, methods, GPU smoke)
+python test/_test_beta.py           # PyTorch 200k-draw moment checks of both beta samplers
+python test/_test_sigma2.py         # PyTorch 200k-draw InvGamma moment checks
+python test/_test_shrinkage.py      # PyTorch inverse-Gaussian / S3-S5 smoke checks
 python test_JAX/_test_GS_LH.py      # JAX end-to-end
 python test_JAX/_test_beta.py       # 200k-draw moment checks of the beta sampler
 python test_JAX/_test_sigma2.py     # 200k-draw InvGamma moment checks
