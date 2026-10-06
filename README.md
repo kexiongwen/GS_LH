@@ -46,9 +46,38 @@ supported throughout.
 - **Minimal chain state**: only $w = \tau/\lambda^2$ is carried between
   iterations; $\lambda, v, \tau$ are regenerated each pass, and
   $\beta, \sigma^2$ are never initialized.
+- **Synchronization-free Gamma draws on CUDA, decided automatically**:
+  both Gamma draws of an iteration (S1 $\sigma^2$, S3 $\lambda$) use the
+  identity $\mathrm{Ga}(\nu/2, r) = \chi^2(\nu)/(2r)$ — no host
+  synchronization, ~30% faster eager GPU iterations — whenever a one-time
+  check (`_accept_chi2`) accepts the half-integer rounding of their
+  shapes ($2p + a$ and $a_1 + n/2$, both constant across the run; the
+  relative moment bias is then $\le 10^{-2}$, and exactly zero for
+  (half-)integer shapes). Refusal is silent (exact Gamma everywhere);
+  CPU always uses exact Gamma. Ported from the
+  [BFM](https://github.com/kexiongwen/BFM) factor-model implementation.
+- **CUDA-graph replay (`graph=True`)**: the whole iteration (S1, S2,
+  S3–S5) is captured once as a single CUDA graph and replayed —
+  3–9× faster GPU iterations (largest gains at launch-bound small
+  regimes; ~4000 it/s at $n{=}100,\ p{=}500$). All sampled systems are
+  I + PSD by construction, so the modules run `cholesky_ex` with no
+  per-solve flag checks; a periodic finiteness audit (`audit_every`)
+  guards the chain instead. Replays advance the RNG normally — a fixed
+  seed replays a run bit-exactly. Requires CUDA with the chi-square
+  check accepted; on CPU, on refusal, or on any capture failure the
+  sampler falls back to the eager loop. Also ported from BFM.
 - **JAX version**: fixed single precision (float32); the whole chain runs
   as chunked `jax.lax.scan` — each chunk is one compiled XLA While loop
-  with no Python dispatch or host synchronization inside.
+  with no Python dispatch or host synchronization inside. The chi-square
+  Gamma path exists here too, with a role change: `jax.random.gamma` is
+  a pure XLA primitive (exact, no host sync), so the approximation is
+  never mandatory — on the GPU backend the same `_accept_chi2` rule
+  engages it as an accuracy-for-speed tradeoff (~1.6–2.8× faster GPU
+  iterations, replacing the exact sampler's per-element rejection
+  while-loop inside the scan); non-GPU backends always use exact Gamma.
+  With `graph=True` (GPU backend), each chunk's scan While loop is
+  additionally recorded as one CUDA graph via XLA command buffers —
+  bitwise-identical chains, a further regime-dependent speedup.
 - **`p >> n` $\sigma^2$ pathology handled by default** (see the caveat
   below): the $\sigma^2$ prior defaults to $\mathrm{InvGamma}(1, 1)$.
 
@@ -134,6 +163,8 @@ Both drivers share the same interface and return a dict:
 | `standardize` | `True` | center $Y$, center and rescale $X$ columns to $\|X_j\|^2 = n$ |
 | `seed` | `None` | RNG seed (fully reproducible chains) |
 | `verbose` | `False` | progress every ~10% of iterations |
+| `graph` | `False` | replay the iteration(s) as CUDA graphs (PyTorch: one graph per iteration, needs the chi-square check accepted; JAX: one graph per scan chunk via XLA command buffers; both need a CUDA device and fall back otherwise) |
+| `audit_every` | `50` | PyTorch: periodic finiteness audit of the chain state (0 disables); JAX: one finiteness audit per scan chunk (unconditional) |
 
 ### PyTorch vs JAX at a glance
 
@@ -141,7 +172,7 @@ Both drivers share the same interface and return a dict:
 | --- | --- | --- |
 | precision | follows input dtype (float64 recommended/tested) | fixed float32 |
 | device | CPU, CUDA | CPU (native Windows); GPU via CUDA — e.g. WSL2 `jax[cuda12]` (tested: RTX 3060 Ti) |
-| sampling loop | eager Python loop | chunked `jax.lax.scan`, whole chain XLA-compiled |
+| sampling loop | eager Python loop, or one CUDA-graph replay (`graph=True`) | chunked `jax.lax.scan`, whole chain XLA-compiled, optionally one CUDA graph per chunk (`graph=True`) |
 | RNG | `torch.manual_seed` | explicit `jax.random.PRNGKey` |
 | draws returned as | CPU `torch.Tensor` | `numpy.ndarray` |
 
@@ -217,15 +248,22 @@ layer only adds overhead to the JAX side. Benchmark scripts:
 ### 2. GPU (float32, RTX 3060 Ti)
 
 All `test_JAX/` suites pass unchanged on the GPU backend; posterior
-means agree with the CPU/float64 reference chains.
+means agree with the CPU/float64 reference chains. The two PyTorch
+columns are one process, one card: the eager loop, and `graph=True`
+(CUDA-graph replay; the one-time capture is excluded from
+`runtime_sec`, mirroring the JAX AOT exclusion). The two JAX columns
+are the plain chunked-scan runners and `graph=True` (XLA command
+buffers: each chunk's scan While loop recorded as one CUDA graph —
+bitwise-identical chains). All GPU columns include the chi-square
+Gamma path (auto-accepted at these $n/p$).
 
-| regime | method | PyTorch (CUDA) | JAX (CUDA) | JAX / PyTorch |
-| --- | --- | --- | --- | --- |
-| $n{=}100,\ p{=}500$ | fast | 328 | ~1500 | **4.6×** |
-| $n{=}100,\ p{=}4000$ | fast | 327 | ~1270 | **3.9×** |
-| $n{=}800,\ p{=}800$ | fast | 291 | ~600 | **2.1×** |
-| $n{=}2000,\ p{=}500$ | direct | 326 | ~740 | **2.3×** |
-| $n{=}8000,\ p{=}500$ | direct | 320 | ~510 | **1.6×** |
+| regime | method | PyTorch eager | PyTorch graph | JAX plain | JAX graph |
+| --- | --- | --- | --- | --- | --- |
+| $n{=}100,\ p{=}500$ | fast | ~440 | ~4000 | ~4200 | ~5100 |
+| $n{=}100,\ p{=}4000$ | fast | ~440 | ~3300 | ~3400 | ~3850 |
+| $n{=}800,\ p{=}800$ | fast | ~430 | ~1270 | ~950 | ~1420 |
+| $n{=}2000,\ p{=}500$ | direct | ~445 | ~2050 | ~1250 | ~1170 |
+| $n{=}8000,\ p{=}500$ | direct | ~450 | ~1930 | ~900 | ~1680 |
 
 ### Reading the tables
 
@@ -235,19 +273,30 @@ means agree with the CPU/float64 reference chains.
   eager PyTorch). PyTorch's multithreaded MKL keeps the edge in the
   large-`direct` regime, which is dominated by one big Cholesky
   factorization per iteration.
-- **GPU, framework vs framework:** JAX is 1.6–4.6× faster than PyTorch
-  on the same card at every regime tested. Its chunked `lax.scan` runs
-  the whole chain as one compiled XLA While loop and touches the host
-  only once per 500 draws, keeping the GPU busy; the eager PyTorch
-  driver launches ~a dozen kernels plus a host copy of the draws every
-  iteration and is launch-latency bound — a flat ~300 it/s at every
-  regime, below PyTorch's own CPU throughput at every size except
-  $n{=}800,\ p{=}800$.
-- **GPU vs CPU:** JAX-GPU overtakes JAX-CPU from $n{=}100,\ p{=}4000$
-  upward (1.3–2.2×); at the smallest regime ($n{=}100,\ p{=}500$) JAX
-  on CPU is the fastest option of all (3596 it/s). Pick the GPU once
-  the per-iteration flops ($O(n^2 p)$ or $O(p^3)$) outweigh the launch
-  overhead.
+- **GPU, framework vs framework:** with both frameworks in their graph
+  modes it is essentially level: JAX-graph leads at the small `fast`
+  regimes (~1.1–1.3×), PyTorch-graph leads at the `direct` regimes
+  (~1.2–1.8×). All GPU columns include the chi-square Gamma path
+  (auto-accepted at these $n/p$): on the JAX side it replaces the exact
+  sampler's per-element rejection while-loop inside the scan (~1.6–2.8×
+  over exact Gamma); the eager PyTorch figures include it plus the
+  sync-free `cholesky_ex` factorizations (~1.2–1.3× over the
+  exact-Gamma, raising-cholesky path they replaced).
+- **GPU, graph modes:** the two `graph=True`s are not symmetric in
+  spirit. The eager PyTorch driver is launch-latency bound — a flat
+  ~440 it/s at every regime — so CUDA-graph replay is transformative
+  (3–9×, largest at launch-bound small regimes; at $n{=}800,\ p{=}800$
+  the $n \times n$ Cholesky dominates and the gain is smallest). The
+  JAX plain runners already execute each chunk as one compiled XLA
+  While loop, so XLA command buffers only shave the intra-loop launch
+  gaps: a modest, regime-dependent gain (about $+5\%$–$+55\%$ at the
+  `fast` regimes, $\sim 2\times$ at $n{=}8000,\ p{=}500$ direct, and
+  slightly negative at $n{=}2000,\ p{=}500$ direct) — but with
+  bitwise-identical chains, so it costs nothing to try per call.
+- **GPU vs CPU:** with the chi-square path engaged, JAX-GPU now matches
+  JAX-CPU even at the smallest regime ($n{=}100,\ p{=}500$) and beats
+  it 2.9–3.8× at the larger regimes; PyTorch-GPU with `graph=True` is
+  above PyTorch-CPU at every regime.
 - GPU throughputs vary ±10–15% between runs (clock/thermal state);
   "~" marks the mean of repeated runs. On a partly occupied 8 GB card,
   export `XLA_PYTHON_CLIENT_PREALLOCATE=false` to skip XLA's default
@@ -276,10 +325,15 @@ python test/_test_GS_LH.py          # PyTorch end-to-end (recovery, methods, GPU
 python test/_test_beta.py           # PyTorch 200k-draw moment checks of both beta samplers
 python test/_test_sigma2.py         # PyTorch 200k-draw InvGamma moment checks
 python test/_test_shrinkage.py      # PyTorch inverse-Gaussian / S3-S5 smoke checks
+python test/_test_chi2.py           # chi-square Gamma path + _accept_chi2 auto-decision
+python test/_test_graph.py          # CUDA-graph mode: quality, fallbacks, reproducibility
+python test/_verify_review_fixes.py # w0 validation, non-finite-state audits, graph verbose line
 python test_JAX/_test_GS_LH.py      # JAX end-to-end
 python test_JAX/_test_beta.py       # 200k-draw moment checks of the beta sampler
 python test_JAX/_test_sigma2.py     # 200k-draw InvGamma moment checks
 python test_JAX/_test_vs_torch.py   # JAX (float32) vs PyTorch (float64) cross-validation
+python test_JAX/_test_chi2.py       # JAX chi-square path + _accept_chi2 (GPU sections need jax[cuda12], e.g. WSL2)
+python test_JAX/_test_graph.py      # JAX graph mode (XLA command buffers): bitwise identity, fallbacks
 python test_JAX/_bench_cpu_vs_torch.py   # CPU float32 benchmark (torch vs JAX)
 python test/_bench_gpu_driver.py         # PyTorch-GPU float32 benchmark (CUDA)
 python test_JAX/_bench_gpu_driver.py     # JAX-GPU float32 benchmark (jax[cuda12], e.g. WSL2)

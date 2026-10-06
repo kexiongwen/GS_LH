@@ -82,14 +82,20 @@ def reuse_check():
     key = jax.random.PRNGKey(123)
     b1 = beta_sample(key, X, Y, w, sigma)
     b2 = beta_sample(key, X, Y, w, sigma, L=L)
-    print("precomputed-L draw identical:", bool(jnp.array_equal(b1, b2)))
+    ok = bool(jnp.array_equal(b1, b2))
+    print("precomputed-L draw identical:", ok)
+    assert ok
 
     XtX, XtY = X.T @ X, X.T @ Y
-    A = XtX.at[jnp.diag_indices(p)].add(w ** -2)
-    Lp = jnp.linalg.cholesky(A)
+    # B-form system of beta_sample_direct (W(X'X)W + I), as GS_LH builds it
+    B = (w[:, None] * XtX) * w[None, :]
+    B = B.at[jnp.diag_indices(p)].add(1.0)
+    Lp = jnp.linalg.cholesky(B)
     d1 = beta_sample_direct(key, X, Y, w, sigma)
     d2 = beta_sample_direct(key, X, Y, w, sigma, L=Lp, XtX=XtX, XtY=XtY)
-    print("direct precomputed-path draw identical:", bool(jnp.array_equal(d1, d2)))
+    ok = bool(jnp.array_equal(d1, d2))
+    print("direct precomputed-path draw identical:", ok)
+    assert ok
 
 
 def benchmark(n=100, p=4000, reps=200):

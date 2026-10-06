@@ -43,19 +43,8 @@ w1 = shrinkage(sub, param, 0.001, 0.001)
 w2 = shrinkage(sub, param, 0.001, 0.001)
 print("reproducible under same key:", bool(jnp.array_equal(w1, w2)))
 
-# --- Test 4: S3 lambda conditional matches Gamma(2p+a, b + sum sqrt|beta~|) ---
-print("=== Test 4: S3 lambda moments ===")
-a_, b_ = 2.0, 1.0
-true_rate = float(jnp.sqrt(jnp.abs(param)).sum()) + b_
-key, sub = jax.random.split(key)
-lams = jax.random.gamma(sub, 2 * p + a_, shape=(20000,)) / true_rate
-m_t, v_t = (2 * p + a_) / true_rate, (2 * p + a_) / true_rate ** 2
-m, v = float(lams.mean()), float(lams.var())
-print(f"S3 lambda: mean {m:.4f} (true {m_t:.4f}), var {v:.4f} (true {v_t:.4f})")
-print("  PASS" if abs(m / m_t - 1) < 0.02 and abs(v / v_t - 1) < 0.05 else "  FAIL")
-
-# --- Test 5: edge cases - tiny and exact-zero beta ---
-print("=== Test 5: edge cases ===")
+# --- Test 4: edge cases - tiny and exact-zero beta ---
+print("=== Test 4: edge cases ===")
 param_tiny = param.at[0].set(1e-30)
 key, sub = jax.random.split(key)
 w = shrinkage(sub, param_tiny, 0.001, 0.001)

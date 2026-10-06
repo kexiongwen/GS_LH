@@ -38,22 +38,75 @@ S2 within every iteration):
               Best when n > p (dense X). Cost per iteration O(p^3) after
               a one-time O(n p^2) precompute of X'X, X'Y, Y'Y.
     "auto"    "fast" if p >= n else "direct".
+
+Chi-square Gamma draws (ported from the BFM factor-model implementation):
+torch._standard_gamma synchronizes the host, so on CUDA both Gamma draws
+of a sweep (S1 sigma^2, S3 lambda) go through the synchronization-free
+identity Ga(nu/2, rate) = chi2(nu)/(2*rate) whenever a one-time up-front
+check (_accept_chi2) accepts the half-integer rounding of the shape
+(relative moment bias <= 1e-2).  Both shapes -- 2p + a and a1 + n/2 --
+are constant across the run, so the check decides every iteration;
+(half-)integer shapes give rel = 0, i.e. an exact draw with no
+approximation at all.  Refusal is silent (exact Gamma everywhere), and
+CPU always uses exact Gamma.  See chi2.py.
+
+CUDA-graph mode (argument `graph`; ported from the same implementation):
+with graph=True on a CUDA device (and the chi-square check accepted) the
+whole iteration -- S1, S2, S3-S5 -- is captured ONCE as a single CUDA
+graph (graph.py) and replayed thereafter, eliminating all per-kernel
+launch overhead; the RNG advances normally across replays.  All sampled
+systems are I + PSD by construction, so the modules
+run cholesky_ex with no per-solve flag checks; numerical safety is
+instead enforced by a periodic finiteness audit (`audit_every`).  On any
+capture failure the sampler warns and falls back to the eager loop; on
+CPU, or when the chi-square check is refused, graph=True simply runs
+eagerly (a note is printed when verbose=True in the latter case).
 """
 
 import time
+import warnings
 
 import torch
 
 from .beta_sample import beta_sample, beta_sample_direct
+from .graph import _graph_sweep_body
 from .shrinkage_sample import shrinkage
 from .sigma2_sample import sigma2_sample, sigma2_sample_direct
 
 __all__ = ["GS_LH"]
 
 
+def _accept_chi2(p, a, a1, n, tol=1e-2):
+    r"""Decide whether the chi-square Gamma approximation is accurate
+    enough for this run (see chi2.py).
+
+    Both Gamma shapes of the sampler are constant across the whole run,
+    so this one check decides every iteration:
+
+        S3 lambda : alpha_lam = 2p + a,
+                    rel_lam = |round(2*alpha_lam)/2 - alpha_lam| / alpha_lam,
+        S1 sigma2 : alpha_s2  = a1 + n/2,
+                    rel_s2  = |round(2*alpha_s2)/2 - alpha_s2| / alpha_s2.
+
+    Returns True  -- max(rel_lam, rel_s2) <= tol: the relative bias of
+    each Gamma draw's mean and variance is at most tol (an O(1/p) resp.
+    O(1/n) perturbation, negligible in the regimes this sampler targets;
+    (half-)integer shapes give rel = 0) and the chi-square path is used
+    automatically on CUDA, in eager execution too (it avoids the
+    host synchronization of torch._standard_gamma);
+    Returns False -- otherwise: the chi-square path is disabled
+    everywhere and the sampler silently uses exact Gamma.
+    """
+    alpha_lam = 2 * p + a
+    rel_lam = abs(round(2 * alpha_lam) / 2 - alpha_lam) / alpha_lam
+    alpha_s2 = a1 + 0.5 * n
+    rel_s2 = abs(round(2 * alpha_s2) / 2 - alpha_s2) / alpha_s2
+    return max(rel_lam, rel_s2) <= tol
+
+
 def GS_LH(X, Y, n_iter, burnin=0, a1=1.0, b1=1.0, a=1e-3, b=1e-3,
           method="auto", w0=None, standardize=True, seed=None,
-          verbose=False):
+          verbose=False, graph=False, audit_every=50):
     """Run the Bayesian L1/2 Gibbs sampler.
 
     Parameters
@@ -90,6 +143,25 @@ def GS_LH(X, Y, n_iter, burnin=0, a1=1.0, b1=1.0, a=1e-3, b=1e-3,
         Seed for torch's global RNG.
     verbose : bool
         Print progress every ~10% of iterations.
+    graph : bool
+        If True, capture the whole iteration (S1, S2, S3-S5) as ONE CUDA
+        graph and replay it (graph.py; large gains for small/launch-bound
+        problems; replays advance the RNG normally and a fixed seed
+        replays a run bit-exactly).  Capture is a one-time cost per
+        GS_LH call (three warm-up iterations plus the recording, excluded
+        from runtime_sec, mirroring the JAX port's AOT exclusion), so
+        graph=True pays off best for longer chains.  Requirements: X on a
+        CUDA device and the chi-square check (_accept_chi2) accepted --
+        the exact Gamma draw is not capturable, so a refused check means
+        graph=True runs eagerly (a note is printed when verbose=True), as
+        does any capture failure (RuntimeWarning) or a non-CUDA device
+        (RuntimeWarning).  See the module docstring.
+    audit_every : int
+        Every this many iterations, verify that w and sigma2 are finite
+        (one scalar host sync per audit, amortized cost negligible).  A
+        non-finite state signals a numerical anomaly outside the guarded
+        range and raises FloatingPointError instead of silently
+        contaminating the chain.  Set to 0 to disable.
 
     Returns
     -------
@@ -100,6 +172,19 @@ def GS_LH(X, Y, n_iter, burnin=0, a1=1.0, b1=1.0, a=1e-3, b=1e-3,
         "preprocess" {"y_mean", "x_mean", "x_scale"} or None
         "w_final"    last state w (for warm restarts)
         "runtime_sec" wall-clock seconds of the loop
+
+    Notes
+    -----
+    On CUDA the two Gamma draws of every iteration (S1 sigma^2, S3
+    lambda) automatically use the synchronization-free chi-square path of
+    chi2.py when the one-time _accept_chi2 check accepts the half-integer
+    rounding of their shapes (relative moment bias <= 1e-2; both shapes,
+    2p + a and a1 + n/2, are constant across the run, and (half-)integer
+    shapes incur no approximation at all).  Refusal is silent -- exact
+    Gamma everywhere; CPU always uses exact Gamma.  For (half-)integer
+    shapes the chi-square draw is exact -- only the computation changes;
+    otherwise each Gamma conditional is perturbed by at most the accepted
+    relative bias on its mean and variance.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -134,12 +219,16 @@ def GS_LH(X, Y, n_iter, burnin=0, a1=1.0, b1=1.0, a=1e-3, b=1e-3,
         w = torch.ones(p, dtype=dtype, device=device)
     else:
         w = w0.to(dtype=dtype, device=device).clone()
-        if torch.any(w <= 0):
-            raise ValueError("w0 must be strictly positive")
+        if not bool(torch.isfinite(w).all()) or bool(torch.any(w <= 0)):
+            raise ValueError("w0 must be finite and strictly positive")
+
+    # --- chi-square decision (one-time; decides every iteration) ---
+    # Accepted -> both Gamma draws of a sweep avoid the host
+    # synchronization of torch._standard_gamma on CUDA (eager included);
+    # refused -> exact Gamma everywhere, silently.  CPU: always exact.
+    chi2_ok = device.type == "cuda" and _accept_chi2(p, a, a1, n)
 
     total = burnin + n_iter
-    beta_keep = torch.empty((n_iter, p), dtype=dtype)      # stored on CPU
-    sigma2_keep = torch.empty(n_iter, dtype=dtype)
     step = max(1, total // 10)
 
     if method == "fast":
@@ -151,28 +240,114 @@ def GS_LH(X, Y, n_iter, burnin=0, a1=1.0, b1=1.0, a=1e-3, b=1e-3,
         pre1 = {"XtX": XtX, "XtY": XtY, "YtY": torch.dot(Y, Y)}
         pre2 = {"XtX": XtX, "XtY": XtY}
 
+    # --- chain storage -------------------------------------------------------
+    # On CUDA runs: page-locked (pinned) buffers so the per-iteration copy
+    # can be issued non-blocking and the D2H transfer overlaps the next
+    # iteration's computation (one stream synchronization at the end
+    # flushes them); if the OS refuses the page-locked allocation we
+    # silently fall back to pageable memory (the copies then simply become
+    # synchronous again).
+    pinned = device.type == "cuda"
+    try:
+        beta_keep = torch.empty((n_iter, p), dtype=dtype, pin_memory=pinned)
+        sigma2_keep = torch.empty(n_iter, dtype=dtype, pin_memory=pinned)
+    except RuntimeError:
+        pinned = False
+        beta_keep = torch.empty((n_iter, p), dtype=dtype)
+        sigma2_keep = torch.empty(n_iter, dtype=dtype)
+
+    # --- optional CUDA-graph capture of the whole iteration ------------------
+    # Requires CUDA (the graph replays device kernels) and the chi-square
+    # check (the exact Gamma draw synchronizes, hence is not capturable).
+    use_graph = graph and device.type == "cuda" and chi2_ok
+    if graph and device.type != "cuda":
+        warnings.warn("graph=True requires a CUDA device; running eagerly",
+                      RuntimeWarning)
+    elif graph and not chi2_ok and verbose:
+        print("GS_LH: graph=True refused (chi-square shape perturbation "
+              "> 1e-2; see _accept_chi2); running eagerly")
+    g = None
+    if use_graph:
+        try:
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):  # warmup (also validates the body)
+                    _graph_sweep_body(X, Y, w, a1, b1, a, b,
+                                      s1_fn, s2_fn, pre1, pre2)
+            torch.cuda.current_stream().wait_stream(stream)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                ow, obeta, os2 = _graph_sweep_body(
+                    X, Y, w, a1, b1, a, b, s1_fn, s2_fn, pre1, pre2)
+        except Exception as exc:  # capture is best-effort: eager fallback
+            warnings.warn(f"CUDA graph capture failed ({type(exc).__name__}: "
+                          f"{exc}); falling back to eager", RuntimeWarning)
+            g = None
+
+    # --- periodic finiteness audit --------------------------------------------
+    # All sampled systems are I + PSD by construction
+    # and the modules run cholesky_ex with no per-solve flag checks, so a
+    # non-finite state signals a numerical anomaly OUTSIDE the guarded
+    # range.  Audit the carried state every `audit_every` iterations (one
+    # scalar host sync per audit, amortized cost negligible) and fail
+    # loudly rather than silently contaminating the chain.
+    def _audit(it, w_t, s2_t):
+        if audit_every and (it + 1) % audit_every == 0 and not (
+            bool(torch.isfinite(w_t).all()) and bool(torch.isfinite(s2_t).all())
+        ):
+            raise FloatingPointError(
+                f"non-finite state (w or sigma2) detected at iteration "
+                f"{it + 1}; the chain is numerically contaminated and must "
+                "be discarded. This should not happen (all systems are "
+                "I + PSD by construction) -- please report the data and "
+                "hyperparameters."
+            )
+
+    # --- run -----------------------------------------------------------------
     t_start = time.perf_counter()
-    for it in range(total):
-        # --- S1 (collapsed sigma^2) and S2 (beta) ---
-        # one factorization shared between S1 and S2
-        sigma2, L = s1_fn(X, Y, w, a1, b1, return_L=True, **pre1)
-        sigma = sigma2.sqrt()
-        beta = s2_fn(X, Y, w, sigma, L=L, **pre2)
+    if g is not None:
+        for it in range(total):
+            g.replay()
+            # carry the new state into the static input buffer
+            w.copy_(ow)
+            if it >= burnin:
+                k = it - burnin
+                # non_blocking: async D2H into pinned memory, in-stream
+                # ordered before the next replay (no-op on CPU targets)
+                beta_keep[k].copy_(obeta, non_blocking=True)
+                sigma2_keep[k].copy_(os2, non_blocking=True)
+            _audit(it, w, os2)
+            if verbose and (it + 1) % step == 0:
+                rate = (it + 1) / (time.perf_counter() - t_start)
+                print(f"[GS_LH] {it + 1}/{total} iterations "
+                      f"({rate:.0f} it/s), sigma2 = {os2.item():.4g}")
+    else:
+        for it in range(total):
+            # --- S1 (collapsed sigma^2) and S2 (beta) ---
+            # one factorization shared between S1 and S2
+            sigma2, L = s1_fn(X, Y, w, a1, b1, return_L=True,
+                              use_chi2=chi2_ok, **pre1)
+            sigma = sigma2.sqrt()
+            beta = s2_fn(X, Y, w, sigma, L=L, **pre2)
 
-        # --- S3-S5: shrinkage parameters; new state w = tau/lambda^2 ---
-        w = shrinkage(beta / sigma, a, b)
+            # --- S3-S5: shrinkage parameters; new state w = tau/lambda^2 ---
+            w = shrinkage(beta / sigma, a, b, use_chi2=chi2_ok)
 
-        # --- collect after burn-in ---
-        if it >= burnin:
-            k = it - burnin
-            beta_keep[k] = beta.cpu()
-            sigma2_keep[k] = sigma2.cpu()
+            # --- collect after burn-in ---
+            if it >= burnin:
+                k = it - burnin
+                beta_keep[k].copy_(beta, non_blocking=True)
+                sigma2_keep[k].copy_(sigma2, non_blocking=True)
 
-        if verbose and (it + 1) % step == 0:
-            rate = (it + 1) / (time.perf_counter() - t_start)
-            print(f"[GS_LH] {it + 1}/{total} iterations "
-                  f"({rate:.0f} it/s), sigma2 = {sigma2.item():.4g}")
+            _audit(it, w, sigma2)
+            if verbose and (it + 1) % step == 0:
+                rate = (it + 1) / (time.perf_counter() - t_start)
+                print(f"[GS_LH] {it + 1}/{total} iterations "
+                      f"({rate:.0f} it/s), sigma2 = {sigma2.item():.4g}")
 
+    if device.type == "cuda":
+        torch.cuda.current_stream().synchronize()  # flush async D2H copies
     runtime = time.perf_counter() - t_start
 
     out = {

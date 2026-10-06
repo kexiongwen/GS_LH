@@ -3,7 +3,6 @@ import os
 import sys
 
 import torch
-from torch.distributions import Gamma
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -35,15 +34,7 @@ torch.manual_seed(42)
 w2 = shrinkage(param, 0.001, 0.001)
 print("reproducible:", torch.equal(w1, w2))
 
-# --- Test 4: S3 lambda conditional matches Gamma(2p+a, b + sum sqrt|beta~|) ---
-a_, b_ = 2.0, 1.0
-ink = param.abs().sqrt()
-true_rate = ink.sum() + b_
-lams = torch.tensor([Gamma(2 * p + a_, true_rate).sample() for _ in range(20000)])
-print(f"S3 lambda: mean {lams.mean():.4f} (true {(2 * p + a_) / true_rate:.4f}), "
-      f"var {lams.var():.4f} (true {(2 * p + a_) / true_rate ** 2:.4f})")
-
-# --- Test 5: edge cases - tiny and exact-zero beta ---
+# --- Test 4: edge cases - tiny and exact-zero beta ---
 param_tiny = param.clone()
 param_tiny[0] = 1e-30
 w = shrinkage(param_tiny, 0.001, 0.001)

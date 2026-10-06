@@ -52,36 +52,60 @@ the S2 beta update of the same Gibbs iteration through the L arguments:
    factorization per iteration covers S1 + S2. Numerically cleanest:
    q is a plain sum of squares, no subtractive cancellation.
 
-2. sigma2_sample_direct -- Woodbury form on the p x p system:
-       q = Y'Y - g' A^{-1} g,   g = X'Y,   A = X'X + S^{-1}.
+2. sigma2_sample_direct -- Woodbury form on the p x p system in the
+   congruence-scaled B-form:
+       q = Y'Y - (Wg)' B^{-1} (Wg),   g = X'Y,   W = diag(w),
+       B = W(X'X)W + I_p = (XW)'(XW) + I_p.
    Cost O(n p^2 + p^3), or O(p^3) per iteration after a one-time
-   O(n p^2) precompute of X'X (arguments XtX/XtY/YtY); best when n > p.
-   The Cholesky factor of A is reused by beta_sample_direct. Subtractive
-   cancellation is possible when q << Y'Y, so q is clamped at 0.
+   O(n p^2) precompute of X'X (arguments XtX/XtY/YtY; B = W(X'X)W + I
+   is then an O(p^2) rescaling); best when n > p.  The Cholesky factor
+   of B is reused by beta_sample_direct. Subtractive cancellation is
+   possible when q << Y'Y, so q is clamped at 0.
+
+   Algebraic note: the B-form is the congruence-scaled equivalent of
+   the canonical Rue (2001) parametrization A = X'X + W^{-2} (posterior
+   precision = X'X + prior precision): A = W^{-1} B W^{-1}, hence
+   g' A^{-1} g = (Wg)' B^{-1} (Wg) and beta = A^{-1} b = W B^{-1} (Wb).
+   The two forms are cost-equivalent and accuracy-equivalent in
+   practice (componentwise-stable solves leave the error dominated by
+   the shared X'X formation); the B-form is implemented because every
+   quantity in it is polynomial in w -- no reciprocals of w anywhere in
+   the S1/S2 pairing -- and B = I_p + (XW)'(XW) shares the I + PSD
+   structure (eigenvalues >= 1) of the fast pairing's M = I_n + XW^2X',
+   whose nonzero spectrum coincides with B's.  (kappa(B) grows like
+   n * max_j w_j^2 versus kappa(A) ~ kappa(X'X) in the sampler's sparse
+   regime -- irrelevant at the accuracies involved, but worth knowing
+   for adversarial near-collinear designs.)
 
 Note: X'X, X'Y and Y'Y are constant across the whole Gibbs run; the
 direct (p x p) path accepts them precomputed via the XtX / XtY / YtY
 arguments (GS_LH does this automatically). JAX arrays are immutable, so
-caller-supplied matrices are never mutated by the diagonal update.
+caller-supplied matrices are never mutated by the congruence scaling.
 """
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsla
 
+from .chi2 import gamma_sample
+
 __all__ = ["sigma2_sample", "sigma2_sample_direct"]
 
 
-def _invgamma_sample(key, concentration, rate):
+def _invgamma_sample(key, concentration, rate, chi2_mask=None):
     """Draw from InvGamma(alpha, gamma) with density
     f(y) proportional to y^{-alpha-1} exp(-gamma / y):
     reciprocal of a Gamma(alpha, rate=gamma) draw.
     (jax.random.gamma samples with unit scale, so divide by the rate.)
+
+    chi2_mask opts in to the chi-square Gamma path (see chi2.py; the
+    scalar concentration's (1, nu) mask is supplied by the driver).
     """
-    return 1 / (jax.random.gamma(key, concentration, dtype=jnp.float32) / rate)
+    return 1 / gamma_sample(key, concentration, rate, chi2_mask=chi2_mask)
 
 
-def sigma2_sample(key, X, Y, w, a1, b1, L=None, return_L=False):
+def sigma2_sample(key, X, Y, w, a1, b1, L=None, return_L=False,
+                  chi2_mask=None):
     """S1 update via the n x n Cholesky of Sigma = I_n + X diag(w^2) X'
     (method 1 above; default for p >= n).
 
@@ -102,6 +126,12 @@ def sigma2_sample(key, X, Y, w, a1, b1, L=None, return_L=False):
     return_L : bool
         If True, return (sigma2, L) so the driver can pass L to
         beta_sample for the S2 update of the same iteration.
+    chi2_mask : jnp.ndarray or None
+        Precomputed (1, nu) mask from chi2.make_chi2_mask([a1 + n/2]),
+        opting in to the chi-square Gamma path (see chi2.py); None draws
+        exact Gamma.  Supplied by the GS_LH driver when its one-time
+        _accept_chi2 check accepts the rounding perturbation (GPU
+        backend only).
 
     Returns
     -------
@@ -122,26 +152,31 @@ def sigma2_sample(key, X, Y, w, a1, b1, L=None, return_L=False):
     z = jsla.solve_triangular(L, Y[:, None], lower=True)[:, 0]
     q = jnp.dot(z, z)
 
-    sigma2 = _invgamma_sample(key, a1 + n / 2, b1 + q / 2)
+    sigma2 = _invgamma_sample(key, a1 + n / 2, b1 + q / 2,
+                              chi2_mask=chi2_mask)
     if return_L:
         return sigma2, L
     return sigma2
 
 
 def sigma2_sample_direct(key, X, Y, w, a1, b1, L=None, return_L=False,
-                         XtX=None, XtY=None, YtY=None):
-    """S1 update via the p x p Woodbury form (method 2 above; best for
-    n > p; companion of beta_sample_direct).
+                         XtX=None, XtY=None, YtY=None, chi2_mask=None):
+    """S1 update via the p x p Woodbury form in the congruence-scaled
+    B-form (method 2 above; best for n > p; companion of
+    beta_sample_direct).
 
-    q = Y'Y - g' A^{-1} g with g = X'Y, A = X'X + diag(w)^{-2}.
+    q = Y'Y - (Wg)' B^{-1} (Wg),  g = X'Y,  W = diag(w),
+    B = W(X'X)W + I_p.
 
-    Parameters: see sigma2_sample; L is the Cholesky factor of A (p x p),
+    Parameters: see sigma2_sample; L is the Cholesky factor of B (p x p),
     shared with beta_sample_direct. return_L returns (sigma2, L).
     XtX, XtY, YtY : jnp.ndarray, optional
         Precomputed X'X, X'Y, Y'Y (constant across Gibbs iterations), as
         supplied by GS_LH; skips their O(n p^2) / O(np) recomputation.
         JAX arrays are immutable: caller-supplied XtX is never mutated
-        by the diagonal update.
+        by the congruence scaling.
+    chi2_mask : jnp.ndarray or None
+        See sigma2_sample.
     """
     X = jnp.asarray(X, dtype=jnp.float32)
     Y = jnp.asarray(Y, dtype=jnp.float32)
@@ -149,17 +184,20 @@ def sigma2_sample_direct(key, X, Y, w, a1, b1, L=None, return_L=False,
     n = X.shape[0]
 
     if L is None:
-        A = XtX if XtX is not None else X.T @ X
-        A = A.at[jnp.diag_indices(A.shape[0])].add(w ** -2)
-        L = jnp.linalg.cholesky(A)
+        B = XtX if XtX is not None else X.T @ X
+        B = (w[:, None] * B) * w[None, :]                  # W (X'X) W
+        B = B.at[jnp.diag_indices(B.shape[0])].add(1.0)    # + I_p
+        L = jnp.linalg.cholesky(B)
 
     g = XtY if XtY is not None else X.T @ Y
-    t = jsla.cho_solve((L, True), g[:, None])[:, 0]
-    # q = Y'Y - g' A^{-1} g >= 0 mathematically; clamp guards roundoff
+    Wg = w * g
+    s = jsla.cho_solve((L, True), Wg[:, None])[:, 0]
+    # q = Y'Y - (Wg)' B^{-1} (Wg) >= 0 mathematically; clamp guards roundoff
     q = jnp.maximum((YtY if YtY is not None else jnp.dot(Y, Y))
-                    - jnp.dot(g, t), 0.0)
+                    - jnp.dot(Wg, s), 0.0)
 
-    sigma2 = _invgamma_sample(key, a1 + n / 2, b1 + q / 2)
+    sigma2 = _invgamma_sample(key, a1 + n / 2, b1 + q / 2,
+                              chi2_mask=chi2_mask)
     if return_L:
         return sigma2, L
     return sigma2

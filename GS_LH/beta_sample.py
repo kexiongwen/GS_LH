@@ -25,11 +25,17 @@ Two samplers of the same target:
    "Prior-Preconditioned Conjugate Gradient Method for Accelerated Gibbs
    Sampling in 'Large n, Large p' Bayesian Sparse Regression", JASA,
    doi:10.1080/01621459.2022.2057859, with a direct Cholesky solve of the
-   p x p system A = X'X + diag(w)^{-2}: cost O(n p^2 + p^3), reduced to
-   O(p^3) per draw when the caller supplies the precomputed X'X (argument
-   XtX). Algebraically the classical Rue (2001) sampler (Cholesky of the
-   p x p posterior precision); best when n > p, the mirror image of
-   beta_sample (whose costs are driven by n).
+   p x p system in the congruence-scaled B-form
+       B = W(X'X)W + I_p = (XW)'(XW) + I_p,   W = diag(w)
+   -- the B-form of A = X'X + diag(w)^{-2} (A = W^{-1} B W^{-1}, so
+   beta = W B^{-1} h with h ~ N(W X'Y, sigma^2 B); no reciprocals of w
+   anywhere, and B = I + Gram shares the I + PSD structure of
+   beta_sample's n x n system, whose nonzero spectrum coincides with
+   B's): cost O(n p^2 + p^3), reduced to O(p^3) per draw when the caller
+   supplies the precomputed X'X (argument XtX). Algebraically the
+   classical Rue (2001) sampler (Cholesky of the p x p posterior
+   precision); best when n > p, the mirror image of beta_sample (whose
+   costs are driven by n).
 
 Choice guide: p >= n -> beta_sample; n > p -> beta_sample_direct.
 """
@@ -86,7 +92,10 @@ def beta_sample(X, Y, w, sigma, L=None):
         Xw = X * w                       # column scaling: (Xw)_{ij} = X_{ij} w_j
         M = Xw @ Xw.T                    # = X diag(w^2) X'
         M.diagonal().add_(1.0)           # + I_n
-        L = torch.linalg.cholesky(M)
+        # cholesky_ex without reading info: M = I + PSD by construction,
+        # so no per-solve host check (CUDA-graph capturable,
+        # synchronization-free; see sigma2_sample.py).
+        L = torch.linalg.cholesky_ex(M)[0]
     omega = torch.cholesky_solve((Y / sigma - v).unsqueeze(-1), L).squeeze(-1)
 
     # Step 4: beta = u + D Phi' omega = u + sigma diag(w^2) X' omega
@@ -96,34 +105,40 @@ def beta_sample(X, Y, w, sigma, L=None):
 def beta_sample_direct(X, Y, w, sigma, L=None, XtX=None, XtY=None):
     """Draw beta ~ N_p(V X'Y, sigma^2 V), V = (X'X + diag(w)^{-2})^{-1}:
     Proposition 2.1 of Nishimura & Suchard (2022) with a direct Cholesky
-    solve of the p x p system.
+    solve of the p x p system in the congruence-scaled B-form.
 
-    On the sigma^2-scaled system A = X'X + diag(w)^{-2}, generate
-    b ~ N(X'Y, sigma^2 A) as
-        b = X'Y + sigma X' eta + sigma w^{-1} . delta,
+    With W = diag(w) and B = W(X'X)W + I_p = (XW)'(XW) + I_p (the B-form
+    of A = X'X + diag(w)^{-2}: A = W^{-1} B W^{-1}, hence V = A^{-1} =
+    W B^{-1} W), generate h ~ N(W X'Y, sigma^2 B) as
+        h = W X'Y + sigma W X' eta + sigma delta,
         eta ~ N(0, I_n),  delta ~ N(0, I_p),
-    then return A^{-1} b via
-    the Cholesky factor of A. Since A^{-1} b has mean V X'Y and covariance
-    sigma^2 A^{-1} = sigma^2 V, this is exactly the target. It is
+    then return beta = W B^{-1} h via the Cholesky factor of B. Since
+    W B^{-1} h has mean W B^{-1} W X'Y = V X'Y and covariance
+    sigma^2 W B^{-1} W = sigma^2 V, this is exactly the target. It is
     algebraically the classical sampler of Rue (2001) (Cholesky of the
-    p x p posterior precision); the b-generation only changes how the
-    Gaussian noise is produced, not the output distribution.
+    p x p posterior precision); the congruence scaling only rewrites the
+    system, and the h-generation only changes how the Gaussian noise is
+    produced, not the output distribution. The B-form needs no
+    reciprocals of w anywhere; its system B = I_p + (XW)'(XW) is I + PSD
+    by construction (eigenvalues >= 1), the same structure as the fast
+    pairing's n x n system I_n + XW^2X' (whose nonzero spectrum
+    coincides with B's).
 
-    Cost: O(n p^2) to form A = X'X plus O(p^3 / 3) Cholesky -- best when
-    n > p (mirror image of beta_sample, whose costs are driven by n).
-    With a caller-supplied precomputed X'X (argument XtX, constant across
-    Gibbs iterations, as supplied by GS_LH) the per-draw cost drops to
-    O(p^3 / 3).
+    Cost: O(n p^2) to form the Gram part of B plus O(p^3 / 3) Cholesky --
+    best when n > p (mirror image of beta_sample, whose costs are driven
+    by n). With a caller-supplied precomputed X'X (argument XtX,
+    constant across Gibbs iterations, as supplied by GS_LH) B is an
+    O(p^2) rescaling of it and the per-draw cost drops to O(p^3 / 3).
 
     Parameters
     ----------
     X, Y, w, sigma : see beta_sample.
     L : torch.Tensor, shape (p, p), optional
-        Precomputed Cholesky factor of A = X'X + diag(w)^{-2}. If None,
-        A is formed and factorized here.
+        Precomputed Cholesky factor of B = W(X'X)W + I_p. If None,
+        B is formed and factorized here.
     XtX, XtY : torch.Tensor, optional
-        Precomputed X'X and X'Y. XtX is cloned before the diagonal
-        update and never mutated.
+        Precomputed X'X and X'Y. XtX is cloned before the congruence
+        scaling and never mutated.
 
     Returns
     -------
@@ -132,15 +147,20 @@ def beta_sample_direct(X, Y, w, sigma, L=None, XtX=None, XtY=None):
     """
     n, p = X.shape
 
-    # Proposition 2.1 on the scaled system: b ~ N(X'Y, sigma^2 A)
+    # Proposition 2.1 on the congruence-scaled system:
+    # h ~ N(W X'Y, sigma^2 B),  W = diag(w),  B = W(X'X)W + I_p
     eta = torch.randn(n, dtype=X.dtype, device=X.device)
     delta = torch.randn_like(w)
-    b = ((XtY if XtY is not None else X.T @ Y)
-         + sigma * (X.T @ eta) + sigma * (delta / w))
+    h = (w * (XtY if XtY is not None else X.T @ Y)
+         + sigma * (w * (X.T @ eta)) + sigma * delta)
 
-    # Direct solve: A = X'X + diag(w)^{-2}, beta = A^{-1} b
+    # Direct solve: B = W(X'X)W + I_p,  beta = W B^{-1} h
     if L is None:
-        A = XtX.clone() if XtX is not None else X.T @ X
-        A.diagonal().add_(w.pow(-2))
-        L = torch.linalg.cholesky(A)
-    return torch.cholesky_solve(b.unsqueeze(-1), L).squeeze(-1)
+        B = XtX.clone() if XtX is not None else X.T @ X
+        B.mul_(w[:, None]).mul_(w[None, :])
+        B.diagonal().add_(1.0)
+        # cholesky_ex without reading info: I + PSD by construction
+        # (see beta_sample above).
+        L = torch.linalg.cholesky_ex(B)[0]
+    u = torch.cholesky_solve(h.unsqueeze(-1), L).squeeze(-1)
+    return w * u

@@ -52,17 +52,19 @@ def sharing_check():
     # n x n factor shared S1 -> S2 (Algorithm 1)
     s2, L = sigma2_sample(X, Y, w, a1, b1, return_L=True)
     b = beta_sample(X, Y, w, s2.sqrt(), L=L)
-    print("n x n L shared with beta_sample: beta finite:",
-          torch.isfinite(b).all().item())
+    ok = bool(torch.isfinite(b).all())
+    print("n x n L shared with beta_sample: beta finite:", ok)
+    assert ok
 
     # p x p factor shared S1 -> S2 (direct)
     s2, Lp = sigma2_sample_direct(X, Y, w, a1, b1, return_L=True)
     b = beta_sample_direct(X, Y, w, s2.sqrt(), L=Lp)
-    print("p x p L shared with beta_sample_direct: beta finite:",
-          torch.isfinite(b).all().item())
+    ok = bool(torch.isfinite(b).all())
+    print("p x p L shared with beta_sample_direct: beta finite:", ok)
+    assert ok
 
     # precomputed XtX/XtY/YtY path (as driven by GS_LH): identical draws,
-    # caller's XtX not mutated by the diagonal update
+    # caller's XtX not mutated by the congruence scaling
     XtX, XtY, YtY = X.T @ X, X.T @ Y, torch.dot(Y, Y)
     torch.manual_seed(11)
     s2a, La = sigma2_sample_direct(X, Y, w, a1, b1, return_L=True)
@@ -71,16 +73,21 @@ def sharing_check():
     s2b, Lb = sigma2_sample_direct(X, Y, w, a1, b1, return_L=True,
                                    XtX=XtX, XtY=XtY, YtY=YtY)
     bb = beta_sample_direct(X, Y, w, s2b.sqrt(), L=Lb, XtX=XtX, XtY=XtY)
-    print("precomputed-XtX path identical:",
-          torch.equal(s2a, s2b) and torch.equal(ba, bb))
-    print("caller XtX not mutated:", torch.equal(XtX, X.T @ X))
+    ok = torch.equal(s2a, s2b) and torch.equal(ba, bb)
+    print("precomputed-XtX path identical:", ok)
+    assert ok
+    ok = torch.equal(XtX, X.T @ X)
+    print("caller XtX not mutated:", ok)
+    assert ok
 
     # determinism
     torch.manual_seed(7)
     r1 = sigma2_sample(X, Y, w, a1, b1)
     torch.manual_seed(7)
     r2 = sigma2_sample(X, Y, w, a1, b1)
-    print("deterministic under same seed:", torch.equal(r1, r2))
+    ok = torch.equal(r1, r2)
+    print("deterministic under same seed:", ok)
+    assert ok
 
 
 def bench(fn, args, reps, cuda):

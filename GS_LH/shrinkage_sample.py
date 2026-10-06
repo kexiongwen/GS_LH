@@ -38,7 +38,8 @@ Design notes
 """
 
 import torch
-from torch.distributions import Gamma
+
+from .chi2 import gamma_sample
 
 __all__ = ["inv_gauss", "shrinkage"]
 
@@ -82,7 +83,7 @@ def inv_gauss(mu):
     return torch.where((1 / (1 + a)) >= torch.rand_like(mu), mu * a, mu / a)
 
 
-def shrinkage(param, a, b):
+def shrinkage(param, a, b, use_chi2=False):
     """One pass of steps S3-S5: draw (lambda, v, tau) given beta~ and
     return the composite scale w = tau / lambda^2.
 
@@ -93,6 +94,11 @@ def shrinkage(param, a, b):
         iteration (the driver divides the freshly drawn beta by sigma).
     a, b : float
         Shape and rate of the hyperprior lambda ~ Gamma(a, b).
+    use_chi2 : bool
+        Opt in to the chi-square path for the S3 Gamma draw (see chi2.py;
+        the scalar concentration 2p + a needs no mask).  The GS_LH driver
+        enables this on CUDA when its one-time _accept_chi2 check accepts
+        the rounding perturbation.
 
     Returns
     -------
@@ -115,7 +121,8 @@ def shrinkage(param, a, b):
     # Sample lam (S3): lam ~ Gamma(2p + a, b + sum sqrt(|beta~|))
     ink = param.abs().clamp_min(torch.finfo(param.dtype).tiny).sqrt()
 
-    lam = Gamma(2 * param.shape[0] + a, ink.sum() + b).sample()
+    lam = gamma_sample(2 * param.shape[0] + a, ink.sum() + b,
+                       use_chi2=use_chi2)
 
     ink = ink.mul_(lam)  # now ink = lam * sqrt(|beta~|)
 

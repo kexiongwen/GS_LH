@@ -42,6 +42,8 @@ Design notes
 import jax
 import jax.numpy as jnp
 
+from .chi2 import gamma_sample
+
 __all__ = ["inv_gauss", "shrinkage"]
 
 
@@ -89,7 +91,7 @@ def inv_gauss(key, mu):
     return jnp.where(1 / (1 + a) >= u, mu * a, mu / a)
 
 
-def shrinkage(key, param, a, b):
+def shrinkage(key, param, a, b, chi2_mask=None):
     """One pass of steps S3-S5: draw (lambda, v, tau) given beta~ and
     return the composite scale w = tau / lambda^2.
 
@@ -101,6 +103,12 @@ def shrinkage(key, param, a, b):
         iteration (the driver divides the freshly drawn beta by sigma).
     a, b : float
         Shape and rate of the hyperprior lambda ~ Gamma(a, b).
+    chi2_mask : jnp.ndarray or None
+        Precomputed (1, nu) mask from chi2.make_chi2_mask([2p + a]),
+        opting in to the chi-square Gamma path for the S3 draw (see
+        chi2.py); None draws exact Gamma.  Supplied by the GS_LH driver
+        when its one-time _accept_chi2 check accepts the rounding
+        perturbation (GPU backend only).
 
     Returns
     -------
@@ -125,8 +133,8 @@ def shrinkage(key, param, a, b):
 
     # Sample lam (S3): lam ~ Gamma(2p + a, b + sum sqrt(|beta~|))  [shape, rate]
     ink = jnp.sqrt(jnp.maximum(jnp.abs(param), jnp.finfo(jnp.float32).tiny))
-    lam = (jax.random.gamma(key_lam, 2 * param.shape[0] + a, dtype=jnp.float32)
-           / (jnp.sum(ink) + b))
+    lam = gamma_sample(key_lam, 2 * param.shape[0] + a, jnp.sum(ink) + b,
+                       chi2_mask=chi2_mask)
 
     ink = ink * lam  # now ink = lam * sqrt(|beta~|)
 

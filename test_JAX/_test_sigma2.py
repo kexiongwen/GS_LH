@@ -69,14 +69,16 @@ def sharing_check():
     k1, k2 = jax.random.split(jax.random.PRNGKey(11))
     s2, L = sigma2_sample(k1, X, Y, w, a1, b1, return_L=True)
     b = beta_sample(k2, X, Y, w, jnp.sqrt(s2), L=L)
-    print("n x n L shared with beta_sample: beta finite:",
-          bool(jnp.isfinite(b).all()))
+    ok = bool(jnp.isfinite(b).all())
+    print("n x n L shared with beta_sample: beta finite:", ok)
+    assert ok
 
     # p x p factor shared S1 -> S2 (direct)
     s2, Lp = sigma2_sample_direct(k1, X, Y, w, a1, b1, return_L=True)
     b = beta_sample_direct(k2, X, Y, w, jnp.sqrt(s2), L=Lp)
-    print("p x p L shared with beta_sample_direct: beta finite:",
-          bool(jnp.isfinite(b).all()))
+    ok = bool(jnp.isfinite(b).all())
+    print("p x p L shared with beta_sample_direct: beta finite:", ok)
+    assert ok
 
     # precomputed XtX/XtY/YtY path (as driven by GS_LH): identical draws
     XtX, XtY, YtY = X.T @ X, X.T @ Y, jnp.dot(Y, Y)
@@ -85,13 +87,16 @@ def sharing_check():
     s2b, Lb = sigma2_sample_direct(k1, X, Y, w, a1, b1, return_L=True,
                                    XtX=XtX, XtY=XtY, YtY=YtY)
     bb = beta_sample_direct(k2, X, Y, w, jnp.sqrt(s2b), L=Lb, XtX=XtX, XtY=XtY)
-    print("precomputed-XtX path identical:",
-          bool(jnp.array_equal(s2a, s2b) and jnp.array_equal(ba, bb)))
+    ok = bool(jnp.array_equal(s2a, s2b) and jnp.array_equal(ba, bb))
+    print("precomputed-XtX path identical:", ok)
+    assert ok
 
     # determinism under the same key
     r1 = sigma2_sample(k1, X, Y, w, a1, b1)
     r2 = sigma2_sample(k1, X, Y, w, a1, b1)
-    print("deterministic under same key:", bool(jnp.array_equal(r1, r2)))
+    ok = bool(jnp.array_equal(r1, r2))
+    print("deterministic under same key:", ok)
+    assert ok
 
 
 def bench(fn, args, reps):

@@ -80,7 +80,9 @@ def reuse_check():
     b1 = beta_sample(X, Y, w, sigma)
     torch.manual_seed(123)
     b2 = beta_sample(X, Y, w, sigma, L=L)
-    print("precomputed-L draw identical:", torch.equal(b1, b2))
+    ok = torch.equal(b1, b2)
+    print("precomputed-L draw identical:", ok)
+    assert ok
 
 
 def rue_sample(X, Y, w, sigma):
